@@ -76,11 +76,13 @@
         return nil;
     }
     NSURL *url = [coder decodeObjectOfClass:[NSURL class] forKey:@"NS.url"];
-    NSString *MIMEType = [coder decodeObjectOfClass:[NSString class] forKey:@"NS.MIMEType"];
+    // Read the earlier Darling archive spelling only when the current key is absent.
+    NSString *mimeKey = [coder containsValueForKey:@"NS.MIMEType"] ? @"NS.MIMEType" : @"NS.mimeType";
+    NSString *MIMEType = [coder decodeObjectOfClass:[NSString class] forKey:mimeKey];
     NSString *encoding = [coder decodeObjectOfClass:[NSString class] forKey:@"NS.textEncodingName"];
     // An object that is archived but of an unexpected class decodes to nil.
     if (([coder containsValueForKey:@"NS.url"] && url == nil) ||
-        ([coder containsValueForKey:@"NS.MIMEType"] && MIMEType == nil) ||
+        ([coder containsValueForKey:mimeKey] && MIMEType == nil) ||
         ([coder containsValueForKey:@"NS.textEncodingName"] && encoding == nil))
     {
         [self release];
@@ -237,9 +239,10 @@ static inline NSString *NSURLLocalizedString(NSString *key)
         return nil;
     }
     NSURL *url = [coder decodeObjectOfClass:[NSURL class] forKey:@"NS.url"];
-    NSDictionary *fields = [coder decodeObjectOfClasses:[NSSet setWithObjects:[NSDictionary class], [NSString class], nil] forKey:@"NS.headerFields"];
+    NSString *fieldsKey = [coder containsValueForKey:@"NS.headerFields"] ? @"NS.headerFields" : @"NS.allHeaderFields";
+    NSDictionary *fields = [coder decodeObjectOfClasses:[NSSet setWithObjects:[NSDictionary class], [NSString class], nil] forKey:fieldsKey];
     if (([coder containsValueForKey:@"NS.url"] && url == nil) ||
-        ([coder containsValueForKey:@"NS.headerFields"] && fields == nil) ||
+        ([coder containsValueForKey:fieldsKey] && fields == nil) ||
         ![coder containsValueForKey:@"NS.statusCode"])
     {
         [self release];
