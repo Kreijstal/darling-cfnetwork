@@ -13,6 +13,7 @@
 #include <darling-boundary-diagnostics.h>
 #import "NSCFURLSession.h"
 #import "NSURLSessionCurl.h"
+#import "NSURLSessionCurlErrors.h"
 #import "NSURLRequestInternal.h"
 #import <CFNetwork/CFNSURLConnection.h>
 
@@ -49,7 +50,7 @@ typedef void (^DataTaskCompletionHandler)(NSData *data, NSURLResponse *response,
 @end
 
 // Apple sends the metrics before URLSession:task:didCompleteWithError:, whether or not the task
-// has a completion handler. Alamofire finishes a request only once both have arrived.
+// has a completion handler. Delegates may wait for both before treating a task as finished.
 static void deliverMetrics(__NSCFURLSession *session, NSURLSessionTask *task, NSURLSessionTaskMetrics *metrics)
 {
     id delegate = [session _delegateRespondingTo:@selector(URLSession:task:didFinishCollectingMetrics:)];
@@ -378,45 +379,6 @@ static NSString *defaultUserAgent(void)
                  cfnetwork >> 16, (cfnetwork >> 8) & 0xff, cfnetwork & 0xff, host.release];
     });
     return agent;
-}
-
-static NSInteger errorCodeForCurlCode(CURLcode code)
-{
-    switch (code)
-    {
-        case CURLE_UNSUPPORTED_PROTOCOL:
-            return NSURLErrorUnsupportedURL;
-        case CURLE_URL_MALFORMAT:
-            return NSURLErrorBadURL;
-        case CURLE_COULDNT_RESOLVE_HOST:
-        case CURLE_COULDNT_RESOLVE_PROXY:
-            return NSURLErrorCannotFindHost;
-        case CURLE_COULDNT_CONNECT:
-            return NSURLErrorCannotConnectToHost;
-        case CURLE_OPERATION_TIMEDOUT:
-            return NSURLErrorTimedOut;
-        case CURLE_SEND_ERROR:
-        case CURLE_RECV_ERROR:
-        case CURLE_PARTIAL_FILE:
-            return NSURLErrorNetworkConnectionLost;
-        case CURLE_GOT_NOTHING:
-        case CURLE_WEIRD_SERVER_REPLY:
-            return NSURLErrorBadServerResponse;
-        case CURLE_BAD_CONTENT_ENCODING:
-            return NSURLErrorCannotDecodeContentData;
-        case CURLE_PEER_FAILED_VERIFICATION:
-            return NSURLErrorServerCertificateUntrusted;
-        case CURLE_SSL_CONNECT_ERROR:
-        case CURLE_SSL_CIPHER:
-        case CURLE_SSL_CACERT_BADFILE:
-        case CURLE_SSL_ENGINE_NOTFOUND:
-        case CURLE_SSL_ENGINE_SETFAILED:
-            return NSURLErrorSecureConnectionFailed;
-        case CURLE_SSL_CERTPROBLEM:
-            return NSURLErrorClientCertificateRejected;
-        default:
-            return NSURLErrorUnknown;
-    }
 }
 
 static size_t headerCallback(char *buffer, size_t size, size_t count, void *task)
@@ -801,6 +763,16 @@ LOCKED_GETTER(int64_t, countOfBytesExpectedToReceive, _countOfBytesExpectedToRec
     curl->easy_setopt(easy, CURLOPT_WRITEFUNCTION, writeCallback);
     curl->easy_setopt(easy, CURLOPT_WRITEDATA, self);
 
+    // libcurl's TLS backend decides server trust, using libcurl's CA bundle
+    // (/etc/ssl/cert.pem) as the only anchors; SecTrust, the keychain and
+    // its trust settings are not consulted. Verification is libcurl's
+    // default, and is set here too so that it stays on. A server that fails
+    // it ends the task with NSURLErrorServerCertificateUntrusted. Without a
+    // SecTrustRef for the connection, delegates are not offered
+    // NSURLAuthenticationMethodServerTrust challenges.
+    curl->easy_setopt(easy, CURLOPT_SSL_VERIFYPEER, 1L);
+    curl->easy_setopt(easy, CURLOPT_SSL_VERIFYHOST, 2L);
+
     NSString *method = [[request HTTPMethod] uppercaseString];
     NSData *body = [request HTTPBody];
     if ([body length] != 0)
@@ -1139,12 +1111,15 @@ LOCKED_GETTER(int64_t, countOfBytesExpectedToReceive, _countOfBytesExpectedToRec
         const char *text = (_curlErrorBuffer != NULL && _curlErrorBuffer[0] != '\0') ? _curlErrorBuffer : [self _curl]->easy_strerror(code);
         message = [NSString stringWithUTF8String:text];
     }
+    long verifyResult = 0;
+    if (code == CURLE_PEER_FAILED_VERIFICATION && _easy != NULL)
+        [self _curl]->easy_getinfo(_easy, CURLINFO_SSL_VERIFYRESULT, &verifyResult);
     [self _releaseEasy];
     _transferDoneWhileAwaiting = NO;
 
     if (code != CURLE_OK)
     {
-        [self _finishWithError:[self _errorWithCode:errorCodeForCurlCode(code) description:message]];
+        [self _finishWithError:[self _errorWithCode:_NSURLSessionErrorCodeForCurl(code, verifyResult) description:message]];
         return;
     }
     if (_redirectRequest != nil)
@@ -1297,8 +1272,8 @@ LOCKED_GETTER(int64_t, countOfBytesExpectedToReceive, _countOfBytesExpectedToRec
             [self autorelease];
         }] retain];
         [(__NSCFURLSessionDataTask *)_innerTask _setMetricsReportedByOwner];
-        /* The delegate hears how far the download is (Feather's progress ring); at most
-           ten times a second, and always the last piece. */
+        /* The delegate hears how far the download is; at most ten times a second, and
+           always the last piece. */
         if (_completionHandler == nil) {
             __block int64_t reported = 0;
             __block CFAbsoluteTime reportedAt = 0;
